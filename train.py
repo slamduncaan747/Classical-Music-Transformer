@@ -1,117 +1,75 @@
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras import regularizers
-from tensorflow.keras.callbacks import TensorBoard, ReduceLROnPlateau
-import pickle
 import numpy as np
-import matplotlib.pyplot as plt
+import pickle
+from tensorflow.keras.utils import to_categorical
 
+# Positional Encoding
+def positional_encoding(position, d_model):
+    angles = np.arange(d_model)[np.newaxis, :] / np.power(10000, (2 * (np.arange(d_model) // 2)) / np.float32(d_model))
+    pos_encoding = np.zeros((position, d_model))
+    pos_encoding[:, 0::2] = np.sin(np.arange(position)[:, np.newaxis] * angles[:, 0::2])
+    pos_encoding[:, 1::2] = np.cos(np.arange(position)[:, np.newaxis] * angles[:, 1::2])
+    return tf.constant(pos_encoding[np.newaxis, ...], dtype=tf.float32)
+
+# Transformer Block
+def transformer_block(inputs, d_model, num_heads, ff_dim, dropout=0.1):
+    attention = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(inputs, inputs)
+    attention = tf.keras.layers.Dropout(dropout)(attention)
+    attention = tf.keras.layers.LayerNormalization(epsilon=1e-6)(attention + inputs)
+    
+    ff = tf.keras.Sequential([
+        tf.keras.layers.Dense(ff_dim, activation='relu'),
+        tf.keras.layers.Dense(d_model),
+    ])
+    ff_output = ff(attention)
+    ff_output = tf.keras.layers.Dropout(dropout)(ff_output)
+    return tf.keras.layers.LayerNormalization(epsilon=1e-6)(ff_output + attention)
+
+# Transformer Model
+def build_transformer(vocab_size, max_seq_len, d_model, num_heads, num_layers, ff_dim):
+    inputs = tf.keras.layers.Input(shape=(max_seq_len,))
+    embeddings = tf.keras.layers.Embedding(vocab_size, d_model)(inputs)
+    pos_encoding = positional_encoding(max_seq_len, d_model)
+    x = embeddings + pos_encoding[:, :max_seq_len, :]
+
+    for _ in range(num_layers):
+        x = transformer_block(x, d_model, num_heads, ff_dim)
+
+    x = x[:, -1, :]
+    outputs = tf.keras.layers.Dense(vocab_size, activation='softmax')(x)
+    return tf.keras.Model(inputs, outputs)
+
+# Load the prepared training data and encoder
 print("Loading token encoder and training data...")
-# Load the encoder that was saved during data preparation
 with open('token_encoder.pkl', 'rb') as f:
     token_encoder = pickle.load(f)
-print(f"Number of unique tokens: {len(token_encoder.classes_)}")
 
-# Load the prepared training data
 X = np.load('X_train.npy')
 y = np.load('y_train.npy')
-print(f"Training data shape: X={X.shape}, y={y.shape}")
 
-print("\nBuilding LSTM model architecture...")
-# Define the improved LSTM model architecture with:
-# 1. Bidirectional LSTM layers for better pattern recognition
-# 2. Increased dropout and L2 regularization
-# 3. Learning rate scheduling
-model = Sequential()
-model.add(Bidirectional(LSTM(512, return_sequences=True), 
-                       input_shape=(X.shape[1], X.shape[2]), 
-                       name='lstm_layer_1'))
-model.add(Bidirectional(LSTM(256, return_sequences=False),
-                       name='lstm_layer_2'))
-model.add(Dropout(0.4, name='dropout_1'))
-model.add(Dense(256, activation='relu', 
-                kernel_regularizer=regularizers.l2(0.01),
-                name='dense_1'))
-model.add(Dropout(0.4, name='dropout_2'))
-model.add(Dense(len(token_encoder.classes_), activation='softmax', 
-                name='output_layer'))
+# Convert y to one-hot encoded format
+y = to_categorical(y, num_classes=len(token_encoder.classes_))
 
-print("\nCompiling model...")
-# Configure training parameters with learning rate scheduler
-model.compile(
-    loss='sparse_categorical_crossentropy',
-    optimizer=Adam(learning_rate=0.001),
-    metrics=['accuracy']
-)
+# Split into training and validation sets
+split_idx = int(len(X) * 0.8)
+X_train, X_val = X[:split_idx], X[split_idx:]
+y_train, y_val = y[:split_idx], y[split_idx:]
 
-# Show detailed model architecture
-print("\nModel Architecture:")
-model.summary()
+train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(64).shuffle(1000)
+val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(64)
 
-# Training configuration
-epochs = 5
-batch_size = 64
-validation_split = 0.2
+# Build and Compile the Model
+d_model = 128
+num_heads = 8
+num_layers = 4
+ff_dim = 512
+max_seq_len = X.shape[1]
+vocab_size = len(token_encoder.classes_)
 
-# Setup callbacks
-tensorboard_callback = TensorBoard(log_dir='./logs', histogram_freq=1)
-lr_scheduler = ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.5,
-    patience=5,
-    min_lr=0.0001,
-    verbose=1
-)
+model = build_transformer(vocab_size, max_seq_len, d_model, num_heads, num_layers, ff_dim)
+model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+              loss='categorical_crossentropy',
+              metrics=['accuracy'])
 
-print(f"\nStarting training for {epochs} epochs with batch size {batch_size}...")
-print(f"Using {validation_split*100}% of data for validation")
-
-# Train the model with callbacks
-history = model.fit(
-    X, y,
-    epochs=epochs,
-    batch_size=batch_size,
-    validation_split=validation_split,
-    verbose=1,
-    callbacks=[tensorboard_callback, lr_scheduler]
-)
-
-print("\nSaving trained model...")
-model.save('melody_lstm_model.h5')
-print("Model saved successfully as 'melody_lstm_model.h5'")
-
-# Print final training results
-final_loss = history.history['loss'][-1]
-final_accuracy = history.history['accuracy'][-1]
-final_val_loss = history.history['val_loss'][-1]
-final_val_accuracy = history.history['val_accuracy'][-1]
-
-print(f"\nFinal Training Results:")
-print(f"Training Loss: {final_loss:.4f}")
-print(f"Training Accuracy: {final_accuracy:.4f}")
-print(f"Validation Loss: {final_val_loss:.4f}") 
-print(f"Validation Accuracy: {final_val_accuracy:.4f}")
-
-# Plot training history
-plt.figure(figsize=(12, 4))
-
-plt.subplot(1, 2, 1)
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Model Loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.legend()
-
-plt.subplot(1, 2, 2)
-plt.plot(history.history['accuracy'], label='Training Accuracy')
-plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
-plt.title('Model Accuracy')
-plt.xlabel('Epochs')
-plt.ylabel('Accuracy')
-plt.legend()
-
-plt.tight_layout()
-plt.show()
+# Train the Model
+model.fit(train_dataset, validation_data=val_dataset, epochs=10)

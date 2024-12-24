@@ -1,75 +1,139 @@
-import tensorflow as tf
+import pretty_midi
 import numpy as np
-import pickle
-from tensorflow.keras.utils import to_categorical
+import os
+import json
+from pathlib import Path
 
-# Positional Encoding
-def positional_encoding(position, d_model):
-    angles = np.arange(d_model)[np.newaxis, :] / np.power(10000, (2 * (np.arange(d_model) // 2)) / np.float32(d_model))
-    pos_encoding = np.zeros((position, d_model))
-    pos_encoding[:, 0::2] = np.sin(np.arange(position)[:, np.newaxis] * angles[:, 0::2])
-    pos_encoding[:, 1::2] = np.cos(np.arange(position)[:, np.newaxis] * angles[:, 1::2])
-    return tf.constant(pos_encoding[np.newaxis, ...], dtype=tf.float32)
-
-# Transformer Block
-def transformer_block(inputs, d_model, num_heads, ff_dim, dropout=0.1):
-    attention = tf.keras.layers.MultiHeadAttention(num_heads=num_heads, key_dim=d_model)(inputs, inputs)
-    attention = tf.keras.layers.Dropout(dropout)(attention)
-    attention = tf.keras.layers.LayerNormalization(epsilon=1e-6)(attention + inputs)
+class MelodyDatasetCreator:
+    def __init__(self, timestep=1/128):  # 1/128 of a quarter note
+        self.timestep = timestep
     
-    ff = tf.keras.Sequential([
-        tf.keras.layers.Dense(ff_dim, activation='relu'),
-        tf.keras.layers.Dense(d_model),
-    ])
-    ff_output = ff(attention)
-    ff_output = tf.keras.layers.Dropout(dropout)(ff_output)
-    return tf.keras.layers.LayerNormalization(epsilon=1e-6)(ff_output + attention)
+    def process_monophonic_midi(self, midi_file):
+        pm = pretty_midi.PrettyMIDI(midi_file)
+        notes = []
+        
+        instrument = pm.instruments[0]
+        
+        # Sort notes by start time and pitch (lower pitch first)
+        sorted_notes = sorted(instrument.notes, key=lambda x: (x.start, x.pitch))
+        
+        # Filter out overlapping notes, keeping the lower pitch
+        filtered_notes = []
+        current_note = None
+        
+        for note in sorted_notes:
+            if current_note is None:
+                current_note = note
+                continue
+            
+            if note.start < current_note.end:
+                # Notes overlap - keep the one with lower pitch
+                if note.pitch < current_note.pitch:
+                    current_note = note
+                # If current note has lower pitch, just skip this one
+                continue
+            else:
+                filtered_notes.append(current_note)
+                current_note = note
+        
+        # Don't forget to append the last note
+        if current_note:
+            filtered_notes.append(current_note)
+        
+        # Process the filtered notes
+        for i, note in enumerate(filtered_notes):
+            # Quantize start and end times to nearest 12th note
+            start = round(note.start / self.timestep) * self.timestep
+            end = round(note.end / self.timestep) * self.timestep
+            duration = end - start
+            
+            # Calculate rest before this note
+            if i > 0:
+                prev_end = round(filtered_notes[i-1].end / self.timestep) * self.timestep
+                rest_duration = start - prev_end
+                if rest_duration > self.timestep/2:  # threshold for minimal rest
+                    rest_steps = round(rest_duration / self.timestep)
+                    notes.append({
+                        'type': 'rest',
+                        'duration_steps': rest_steps
+                    })
+            
+            # Add the note
+            duration_steps = round(duration / self.timestep)
+            notes.append({
+                'type': 'note',
+                'pitch': note.pitch,
+                'duration_steps': duration_steps
+            })
+        
+        return notes
 
-# Transformer Model
-def build_transformer(vocab_size, max_seq_len, d_model, num_heads, num_layers, ff_dim):
-    inputs = tf.keras.layers.Input(shape=(max_seq_len,))
-    embeddings = tf.keras.layers.Embedding(vocab_size, d_model)(inputs)
-    pos_encoding = positional_encoding(max_seq_len, d_model)
-    x = embeddings + pos_encoding[:, :max_seq_len, :]
+    def create_tokens(self, notes):
+        tokens = []
+        
+        # New token mapping:
+        # Notes: 0-127 (unchanged, MIDI standard)
+        # Rest marker: 200
+        # Duration tokens: 300-400 (giving us space for up to 100 different duration values)
+        
+        for note in notes:
+            if note['type'] == 'rest':
+                tokens.append(200)  # Rest token now uses 200 instead of 128
+                # Duration tokens now start at 300
+                duration_token = min(note['duration_steps'] // 12, 99)  # Max of 99 to keep under 400
+                tokens.append(300 + duration_token)
+            else:
+                tokens.append(note['pitch'])
+                # Duration tokens now start at 300
+                duration_token = min(note['duration_steps'] // 12, 99)  # Max of 99 to keep under 400
+                tokens.append(300 + duration_token)
+        
+        return tokens
 
-    for _ in range(num_layers):
-        x = transformer_block(x, d_model, num_heads, ff_dim)
+    def process_directory(self, midi_dir, output_file):
+        midi_dir = Path(midi_dir)
+        all_sequences = []
+        
+        # Process each MIDI file
+        for midi_path in midi_dir.glob('**/*.mid*'):  # catches both .mid and .midi
+            try:
+                notes = self.process_monophonic_midi(str(midi_path))
+                if notes:  # if not None (no overlapping notes)
+                    tokens = self.create_tokens(notes)
+                    all_sequences.append({
+                        'file': str(midi_path.relative_to(midi_dir)),
+                        'tokens': tokens
+                    })
+            except Exception as e:
+                print(f"Error processing {midi_path}: {e}")
+        
+        # Save all sequences to a file
+        with open(output_file, 'w') as f:
+            json.dump(all_sequences, f)
+        
+        print(f"Processed {len(all_sequences)} files successfully")
+        return all_sequences
 
-    x = x[:, -1, :]
-    outputs = tf.keras.layers.Dense(vocab_size, activation='softmax')(x)
-    return tf.keras.Model(inputs, outputs)
+def main():
+    # Create dataset
+    creator = MelodyDatasetCreator()
+    
+    # Process all MIDI files in directory
+    midi_dir = "./files"
+    output_file = "melody_dataset.json"
+    
+    sequences = creator.process_directory(midi_dir, output_file)
+    
+    # Print some statistics
+    if sequences:
+        num_sequences = len(sequences)
+        total_tokens = sum(len(seq['tokens']) for seq in sequences)
+        avg_length = total_tokens / num_sequences
+        
+        print(f"\nDataset Statistics:")
+        print(f"Number of sequences: {num_sequences}")
+        print(f"Average sequence length: {avg_length:.2f} tokens")
+        print(f"Dataset saved to: {output_file}")
 
-# Load the prepared training data and encoder
-print("Loading token encoder and training data...")
-with open('token_encoder.pkl', 'rb') as f:
-    token_encoder = pickle.load(f)
-
-X = np.load('X_train.npy')
-y = np.load('y_train.npy')
-
-# Convert y to one-hot encoded format
-y = to_categorical(y, num_classes=len(token_encoder.classes_))
-
-# Split into training and validation sets
-split_idx = int(len(X) * 0.8)
-X_train, X_val = X[:split_idx], X[split_idx:]
-y_train, y_val = y[:split_idx], y[split_idx:]
-
-train_dataset = tf.data.Dataset.from_tensor_slices((X_train, y_train)).batch(64).shuffle(1000)
-val_dataset = tf.data.Dataset.from_tensor_slices((X_val, y_val)).batch(64)
-
-# Build and Compile the Model
-d_model = 128
-num_heads = 8
-num_layers = 4
-ff_dim = 512
-max_seq_len = X.shape[1]
-vocab_size = len(token_encoder.classes_)
-
-model = build_transformer(vocab_size, max_seq_len, d_model, num_heads, num_layers, ff_dim)
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
-
-# Train the Model
-model.fit(train_dataset, validation_data=val_dataset, epochs=10)
+if __name__ == "__main__":
+    main()
