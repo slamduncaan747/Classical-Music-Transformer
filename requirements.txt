@@ -1,3 +1,4 @@
 tensorflow>=2.0.0
 numpy>=1.19.2
 scikit-learn>=0.24.0  # for the token encoder 
+pretty-midi

@@ -1,148 +1,113 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-import pickle
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import json
+from melody_model import MelodyTransformer
 
-# Positional Encoding
-def positional_encoding(position, d_model):
-    angles = torch.arange(d_model)[None, :] / torch.pow(10000, (2 * (torch.arange(d_model) // 2)) / float(d_model))
-    pos_encoding = torch.zeros((position, d_model))
-    pos_encoding[:, 0::2] = torch.sin(torch.arange(position)[:, None] * angles[:, 0::2])
-    pos_encoding[:, 1::2] = torch.cos(torch.arange(position)[:, None] * angles[:, 1::2])
-    return pos_encoding.unsqueeze(0)  # Add batch dimension
+class MelodyDataset(Dataset):
+    def __init__(self, json_file, sequence_length=64):
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+        
+        self.sequence_length = sequence_length
+        self.tokens = []
+        for item in data:
+            self.tokens.extend(item['tokens'])
+        
+        # Print token statistics
+        print("Token statistics:")
+        print(f"Min token value: {min(self.tokens)}")
+        print(f"Max token value: {max(self.tokens)}")
+        print(f"Total tokens: {len(self.tokens)}")
+        
+        self.tokens = torch.tensor(self.tokens, dtype=torch.long)
+    
+    def __len__(self):
+        return len(self.tokens) - self.sequence_length - 1
+    
+    def __getitem__(self, idx):
+        sequence = self.tokens[idx:idx + self.sequence_length]
+        target = self.tokens[idx + 1:idx + self.sequence_length + 1]
+        return sequence, target
 
-# Transformer Block
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, num_heads, ff_dim, dropout=0.1):
-        super(TransformerBlock, self).__init__()
-        self.attention = nn.MultiheadAttention(embed_dim=d_model, num_heads=num_heads, dropout=dropout)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.ReLU(),
-            nn.Linear(ff_dim, d_model)
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout2 = nn.Dropout(dropout)
+def train_one_epoch(model, dataloader, optimizer, criterion, device):
+    model.train()
+    total_loss = 0
+    
+    for batch_idx, (sequences, targets) in enumerate(dataloader):
+        # Print shape and value information for debugging
+        if batch_idx == 0:
+            print(f"\nSequences shape: {sequences.shape}")
+            print(f"Sequences min: {sequences.min()}, max: {sequences.max()}")
+            print(f"Targets shape: {targets.shape}")
+            print(f"Targets min: {targets.min()}, max: {targets.max()}")
+        
+        sequences, targets = sequences.to(device), targets.to(device)
+        
+        optimizer.zero_grad()
+        output = model(sequences)  # shape: [batch_size, seq_length, vocab_size]
+        
+        # Reshape for cross entropy
+        output = output.view(-1, model.vocab_size)  # shape: [batch_size * seq_length, vocab_size]
+        targets = targets.view(-1)  # shape: [batch_size * seq_length]
+        
+        loss = criterion(output, targets)
+        loss.backward()
+        optimizer.step()
+        
+        total_loss += loss.item()
+        
+        if batch_idx % 10 == 0:
+            print(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
+    
+    return total_loss / len(dataloader)
 
-    def forward(self, x):
-        # x shape: [batch_size, seq_len, embed_dim]
-        if len(x.shape) == 4:  # If x is incorrectly 4D
-            x = x.squeeze(1)   # Remove the extra dimension (likely caused by unsqueeze or view)
-
-        # Transpose for MultiheadAttention if batch_first=False
-        if not self.attention.batch_first:
-            x = x.transpose(0, 1)  # [seq_len, batch_size, embed_dim]
-
-        # MultiheadAttention expects [seq_len, batch_size, embed_dim]
-        attn_output, _ = self.attention(x, x, x)
-
-        # Residual connection
-        x = attn_output + x
-
-        # Apply layer norm
-        x = self.norm1(x)
-
-        # Feedforward
-        ff_output = self.ff(x)
-        ff_output = self.dropout(ff_output)
-
-        # Residual connection
-        x = ff_output + x
-        x = self.norm2(x)
-
-        # If batch_first=False, transpose back for subsequent layers
-        if not self.attention.batch_first:
-            x = x.transpose(0, 1)  # [batch_size, seq_len, embed_dim]
-
-        return x
-
-
-# Transformer Model
-class TransformerModel(nn.Module):
-    def __init__(self, vocab_size, max_seq_len, d_model, num_heads, num_layers, ff_dim):
-        super(TransformerModel, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        self.pos_encoding = positional_encoding(max_seq_len, d_model)
-        self.layers = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, ff_dim) for _ in range(num_layers)
-        ])
-        self.fc = nn.Linear(d_model, vocab_size)
-
-    def forward(self, x):
-        x = self.embedding(x) + self.pos_encoding[:, :x.size(1), :]
-        x = x.transpose(0, 1)  # Switch to (seq_len, batch_size, d_model) for MultiheadAttention
-        for layer in self.layers:
-            x = layer(x)
-        x = x[-1, :, :]  # Take the output of the last token (sequence end)
-        return self.fc(x)
-
-# Load the prepared training data and encoder
-print("Loading token encoder and training data...")
-with open('token_encoder.pkl', 'rb') as f:
-    token_encoder = pickle.load(f)
-
-X = np.load('X_train.npy')
-y = np.load('y_train.npy')
-
-# Convert y to one-hot encoded format
-y = torch.tensor(y, dtype=torch.long)
-
-# Split into training and validation sets
-split_idx = int(len(X) * 0.8)
-X_train, X_val = X[:split_idx], X[split_idx:]
-y_train, y_val = y[:split_idx], y[split_idx:]
-
-# Create DataLoaders
-train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.long), y_train)
-val_dataset = TensorDataset(torch.tensor(X_val, dtype=torch.long), y_val)
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=64)
-
-# Model Configuration
-d_model = 128
-num_heads = 8
-num_layers = 4
-ff_dim = 512
-max_seq_len = X.shape[1]
-vocab_size = len(token_encoder.classes_)
-
-# Initialize Model
-model = TransformerModel(vocab_size, max_seq_len, d_model, num_heads, num_layers, ff_dim)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = model.to(device)
-
-# Loss and Optimizer
-criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=1e-4)
-
-# Training Loop
-def train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10):
+def train_model(model, json_file, epochs=10, batch_size=32, lr=0.001):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    model = model.to(device)
+    
+    dataset = MelodyDataset(json_file)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
     for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
+        print(f"\nEpoch {epoch+1}/{epochs}")
+        avg_loss = train_one_epoch(model, dataloader, optimizer, criterion, device)
+        print(f"Average loss: {avg_loss:.4f}")
+        
+        # Save model
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'loss': avg_loss,
+        }, f'melody_model_epoch_{epoch+1}.pt')
 
-        val_loss = 0
-        model.eval()
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-                val_loss += loss.item()
-
-        print(f"Epoch {epoch + 1}/{epochs}, Train Loss: {train_loss / len(train_loader):.4f}, Val Loss: {val_loss / len(val_loader):.4f}")
-
-# Train the Model
-train_model(model, train_loader, val_loader, criterion, optimizer, epochs=10)
+if __name__ == "__main__":
+    # Initialize model with vocab size based on your actual token range
+    # We'll print the token range first to determine this
+    
+    with open('melody_dataset.json', 'r') as f:
+        data = json.load(f)
+    
+    all_tokens = []
+    for item in data:
+        all_tokens.extend(item['tokens'])
+    
+    vocab_size = max(all_tokens) + 1
+    print(f"\nRequired vocabulary size: {vocab_size}")
+    
+    model = MelodyTransformer(vocab_size=vocab_size)
+    print(f"Model vocabulary size: {model.vocab_size}")
+    
+    # Train model
+    train_model(model, 
+                json_file='melody_dataset.json',
+                epochs=20,
+                batch_size=32,
+                lr=0.001)
