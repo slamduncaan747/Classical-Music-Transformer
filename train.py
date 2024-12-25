@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 import json
 import math
 
@@ -48,37 +48,45 @@ class MelodyTransformer(nn.Module):
         
         return output
 
-class MelodyDataset(Dataset):
-    def __init__(self, json_file, sequence_length=64):
-        with open(json_file, 'r') as f:
-            data = json.load(f)
-        
-        self.sequence_length = sequence_length
-        self.tokens = []
-        for item in data:
-            self.tokens.extend(item['tokens'])
-        
-        # Print token statistics
-        print("Token statistics:")
-        print(f"Min token value: {min(self.tokens)}")
-        print(f"Max token value: {max(self.tokens)}")
-        print(f"Total tokens: {len(self.tokens)}")
-        
-        self.tokens = torch.tensor(self.tokens, dtype=torch.long)
+def prepare_data(json_file, sequence_length=64):
+    with open(json_file, 'r') as f:
+        data = json.load(f)
     
-    def __len__(self):
-        return len(self.tokens) - self.sequence_length - 1
+    tokens = []
+    for item in data:
+        tokens.extend(item['tokens'])
+        
+    # Print token statistics
+    print("Token statistics:")
+    print(f"Min token value: {min(tokens)}")
+    print(f"Max token value: {max(tokens)}")
+    print(f"Total tokens: {len(tokens)}")
     
-    def __getitem__(self, idx):
-        sequence = self.tokens[idx:idx + self.sequence_length]
-        target = self.tokens[idx + 1:idx + self.sequence_length + 1]
-        return sequence, target
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    
+    # Create input/target sequences
+    x_train = []
+    y_train = []
+    
+    for i in range(0, len(tokens) - sequence_length - 1):
+        x_train.append(tokens[i:i + sequence_length])
+        y_train.append(tokens[i + 1:i + sequence_length + 1])
+        
+    x_train = torch.stack(x_train)
+    y_train = torch.stack(y_train)
+    
+    return x_train, y_train
 
-def train_one_epoch(model, dataloader, optimizer, criterion, device):
+def train_one_epoch(model, x_train, y_train, optimizer, criterion, device, batch_size=32):
     model.train()
     total_loss = 0
+    num_batches = 0
     
-    for batch_idx, (sequences, targets) in enumerate(dataloader):
+    # Create dataloader
+    train_dataset = TensorDataset(x_train, y_train)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    for batch_idx, (sequences, targets) in enumerate(train_loader):
         # Print shape and value information for debugging
         if batch_idx == 0:
             print(f"\nSequences shape: {sequences.shape}")
@@ -100,27 +108,25 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device):
         optimizer.step()
         
         total_loss += loss.item()
+        num_batches += 1
         
         if batch_idx % 10 == 0:
             print(f'Batch {batch_idx}, Loss: {loss.item():.4f}')
     
-    return total_loss / len(dataloader)
+    return total_loss / num_batches
 
-def train_model(model, json_file, epochs=10, batch_size=32, lr=0.001):
+def train_model(model, x_train, y_train, epochs=10, batch_size=32, lr=0.001):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     model = model.to(device)
-    
-    dataset = MelodyDataset(json_file)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch+1}/{epochs}")
-        avg_loss = train_one_epoch(model, dataloader, optimizer, criterion, device)
+        avg_loss = train_one_epoch(model, x_train, y_train, optimizer, criterion, device, batch_size)
         print(f"Average loss: {avg_loss:.4f}")
         
         # Save model
@@ -148,9 +154,11 @@ if __name__ == "__main__":
     model = MelodyTransformer(vocab_size=vocab_size)
     print(f"Model vocabulary size: {model.vocab_size}")
     
+    # Prepare training data
+    x_train, y_train = prepare_data('melody_dataset.json')
+    
     # Train model
-    train_model(model, 
-                json_file='melody_dataset.json',
+    train_model(model, x_train, y_train,
                 epochs=20,
                 batch_size=32,
                 lr=0.001)
