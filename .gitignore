@@ -1,0 +1,15 @@
+# Ignore media files
+*.csv
+*.mid
+*.mp3
+*.npy
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Keep specific folders
+!test/
+!train/
+!valid/
