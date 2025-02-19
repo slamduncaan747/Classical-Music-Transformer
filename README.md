@@ -1,0 +1,42 @@
+# Classical Music Transformer
+
+This project uses a transformer network (built with PyTorch) to generate classical music. It trains on choral sequences and then creates new music as MIDI files.
+
+## What It Does
+
+- **Training:** The model learns from a dataset of choral sequences (in `choral_sequences.csv`).
+- **Music Generation:** Once trained, the model can generate new music, which is saved as a MIDI file.
+
+## How to Use
+
+1. **Install Requirements:**  
+   Make sure you have Python 3.7+ and install the necessary packages with:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Train the Model:**  
+   Run the training script:
+   ```bash
+   python train.py
+   ```
+   This will train the model and save it as `music_transformer_model.pt`.
+
+3. **Generate Music:**  
+   Use the generated model to create music:
+   ```bash
+   python generate.py --model music_transformer_model.pt --length 100 --output generated
+   ```
+   This will create a MIDI file (e.g., `generated.mid`).
+
+## Files Overview
+
+- **train.py:** Script to train the transformer model.
+- **generate.py:** Script to generate music and save it as a MIDI file.
+- **choral_sequences.csv:** CSV file with choral sequences for training.
+- **requirements.txt:** List of all required Python libraries.
+
+## Extra Notes
+
+- Feel free to tweak the parameters in the scripts to see different results.
+- Enjoy creating and listening to your own generated classical music!
